@@ -1,18 +1,23 @@
-import re
+import os
 import json
+import time
 import base64
-import random
 import asyncio
 import typing
 import logging
+import signal
+from random import randint
+from string import capwords
+from http import HTTPStatus
+from urllib.parse import splitport
+from socket import AF_INET, AF_INET6, inet_pton, inet_ntop, socket as RawSocket
 
 import websockets
 from websockets import WebSocketClientProtocol
-from socks5.server import Socks5
-from socks5.server.sessions import ConnectSession as _ConnectSession
 
 from .types import Socket
-from .utils import Singleton
+from .utils import onlyfirst, create_task
+from .config import config, g, TCP
 from . import rule
 
 
@@ -35,84 +40,47 @@ class WebsocksRefused(ConnectionRefusedError):
     pass
 
 
-################################################
-# POLICY
-################################################
-
-
-__policy__ = "AUTO"
-
-
-def set_policy(policy: str) -> None:
-    global __policy__
-    __policy__ = policy
-
-
-def get_policy() -> str:
-    return __policy__
-
-
-################################################
-# WEBSOCKET POOL
-################################################
-
-
-class ServerURL:
-    def __init__(self, server_url: str) -> None:
-        url_format = re.compile(
-            r"(?P<protocol>(ws|wss))://(?P<username>.+?):(?P<password>.+?)@(?P<uri>.+)"
-        )
-        match = url_format.match(server_url)
-        self.protocol = match.group("protocol")
-        self.username = match.group("username")
-        self.password = match.group("password")
-        self.uri = match.group("uri")
-
-    def __str__(self) -> str:
-        return f"{self.protocol}://{self.uri}"
-
-    def __repr__(self) -> str:
-        return self.__str__()
-
-
 class Pool:
-    def __init__(self, server: str, initsize: int = 7) -> None:
-        server_url = ServerURL(server)
+    def __init__(self, server_config: TCP, initsize: int = 7) -> None:
         self.get_credentials = lambda: "Basic " + base64.b64encode(
-            f"{server_url.username}:{server_url.password}".encode("utf8")
+            f"{server_config.username}:{server_config.password}".encode("utf8")
         ).decode("utf8")
-        self.server = str(server_url)
-
+        self.server = server_config.protocol + "://" + server_config.url
+        logger.info(
+            f"Server: "
+            + server_config.protocol
+            + "://"
+            + server_config.username
+            + "@"
+            + server_config.url
+        )
         self.initsize = initsize
         self._freepool = set()
-        self.init(initsize)
-        self.create_timed_task()
+        create_task(asyncio.get_event_loop(), self.clear_pool())
 
-    def init(self, size: int) -> None:
-        """初始化 Socket 池"""
-        for _ in range(size):
-            asyncio.get_event_loop().create_task(self._create())
+    async def clear_pool(self) -> None:
+        """
+        定时清理池中的 WebSocket
+        """
+        while True:
+            await asyncio.sleep(7)
 
-    def create_timed_task(self) -> None:
-        """定时清理池中的 Socket"""
-
-        async def timed_task() -> None:
-            while True:
-                await asyncio.sleep(7)
-
-                for sock in tuple(self._freepool):
-                    if sock.closed:
-                        await sock.close()
-                        self._freepool.remove(sock)
-
-                while len(self._freepool) > self.initsize * 2:
-                    sock = self._freepool.pop()
+            for sock in tuple(self._freepool):
+                if sock.closed:
                     await sock.close()
+                    self._freepool.remove(sock)
 
-        _task = asyncio.get_event_loop().create_task(timed_task())
-        _task.add_done_callback(lambda task: self.create_timed_task())
+            while len(self._freepool) > self.initsize * 2:
+                sock = self._freepool.pop()
+                await sock.close()
+
+            while len(self._freepool) < self.initsize:
+                await self._create()
 
     async def acquire(self) -> WebSocketClientProtocol:
+        """
+        取出存活的 WebSocket 连接
+        """
         while True:
             try:
                 sock = self._freepool.pop()
@@ -126,6 +94,9 @@ class Pool:
                 await self._create()
 
     async def release(self, sock: WebSocketClientProtocol) -> None:
+        """
+        归还 WebSocket 连接
+        """
         if not isinstance(sock, websockets.WebSocketClientProtocol):
             return
         if sock.closed:
@@ -134,6 +105,9 @@ class Pool:
         self._freepool.add(sock)
 
     async def _create(self) -> None:
+        """
+        连接远端服务器
+        """
         try:
             sock = await websockets.connect(
                 self.server, extra_headers={"Authorization": self.get_credentials()}
@@ -141,20 +115,8 @@ class Pool:
             self._freepool.add(sock)
         except websockets.exceptions.InvalidStatusCode as e:
             logger.error(str(e))
-
-
-class Pools(metaclass=Singleton):
-    def __init__(self, pools: typing.Sequence[Pool] = []) -> None:
-        self.__pools = list(pools)
-
-    def add(self, pool: Pool) -> None:
-        self.__pools.append(pool)
-
-    def all(self) -> typing.List[Pool]:
-        return self.__pools
-
-    def random(self) -> Pool:
-        return random.choice(self.__pools)
+        except OSError:
+            logger.error(f"IOError in connect {self.server}")
 
 
 OPENED = "OPENED"
@@ -169,14 +131,14 @@ class WebSocket(Socket):
 
     @classmethod
     async def create_connection(cls, host: str, port: int) -> "WebSocket":
-        pool = Pools().random()
+        pool = g.pool
         while True:
             try:
                 sock = await pool.acquire()
                 # websocks shake hand
                 await sock.send(json.dumps({"HOST": host, "PORT": port}))
                 resp = await sock.recv()
-                assert isinstance(resp, str), "must be str"
+                assert isinstance(resp, str)
                 if not json.loads(resp)["ALLOW"]:
                     # websocks close
                     await sock.send(json.dumps({"STATUS": "CLOSED"}))
@@ -247,12 +209,17 @@ class TCPSocket(Socket):
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.r = reader
         self.w = writer
+        self.__socket = writer.get_extra_info("socket")
 
     @classmethod
     async def create_connection(cls, host: str, port: int) -> "TCPSocket":
         """create a TCP socket"""
         r, w = await asyncio.open_connection(host=host, port=port)
         return TCPSocket(r, w)
+
+    @property
+    def socket(self) -> RawSocket:
+        return self.__socket
 
     async def recv(self, num: int = 4096) -> bytes:
         data = await self.r.read(num)
@@ -276,28 +243,150 @@ class TCPSocket(Socket):
     def closed(self) -> bool:
         return self.w.is_closing()
 
+    def __del__(self):
+        self.w.close()
 
-class ConnectSession(_ConnectSession):
-    async def connect_remote(self, host: str, port: int) -> Socket:
-        """
-        connect remote and return Socket
-        """
-        need_proxy = rule.judge(host)
-        if (need_proxy and get_policy() != "DIRECT") or get_policy() == "PROXY":
+
+async def connect_remote(host: str, port: int) -> Socket:
+    """
+    connect remote and return Socket
+    """
+    need_proxy = rule.judge(host)
+    rule.logger.debug(f"{host} need proxy? {need_proxy}")
+    if (
+        need_proxy and config.proxy_policy != "DIRECT"
+    ) or config.proxy_policy == "PROXY":
+        remote = await WebSocket.create_connection(host, port)
+    elif need_proxy is None and config.proxy_policy == "AUTO":
+        try:
+            remote = await asyncio.wait_for(
+                TCPSocket.create_connection(host, port), timeout=2.3
+            )
+        except (OSError, asyncio.TimeoutError):
             remote = await WebSocket.create_connection(host, port)
-        elif need_proxy is None and get_policy() == "AUTO":
-            try:
-                remote = await asyncio.wait_for(
-                    TCPSocket.create_connection(host, port), timeout=2.3
-                )
-            except (OSError, asyncio.TimeoutError):
-                remote = await WebSocket.create_connection(host, port)
-                rule.add(host)
+    else:
+        remote = await TCPSocket.create_connection(host, port)
+    return remote
+
+
+async def bridge(s0: Socket, s1: Socket) -> None:
+    async def _(sender: Socket, receiver: Socket):
+        try:
+            while True:
+                data = await sender.recv(8192)
+                if not data:
+                    break
+                await receiver.send(data)
+        except OSError:
+            pass
+
+    await onlyfirst(_(s0, s1), _(s1, s0))
+
+
+class Client:
+    def __init__(self, host: str = "0.0.0.0", port: int = 3128) -> None:
+        self.host = host
+        self.port = port
+        if "tcp_server" not in config:
+            raise RuntimeError("You need to specify a websocks server.")
+        g.pool = Pool(config.tcp_server)
+
+    async def dispatch(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        firstline = await reader.readline()
+        for index, data in enumerate(firstline):
+            reader._buffer.insert(index, data)
+        method = firstline.decode("ascii").split(" ", maxsplit=1)[0]
+        sock = TCPSocket(reader, writer)
+        try:
+            await getattr(self, method.lower(), self.default)(sock)
+        finally:
+            await sock.close()
+
+    async def default(self, sock: TCPSocket) -> None:
+        firstline = await sock.r.readline()
+        if firstline == b"":
+            return
+
+        method, url, version = firstline.decode("ascii").strip().split(" ")
+
+        scheme = url.split("://")[0]
+        if "/" in url.split("://")[1]:
+            netloc, urlpath = url.split("://")[1].split("/", 1)
         else:
-            remote = await TCPSocket.create_connection(host, port)
-        return remote
+            netloc = url.split("://")[1]
+            urlpath = ""
+        urlpath = "/" + urlpath
 
+        host, port = splitport(netloc)
+        if port is None:
+            port = {"http": 80, "https": 443}[scheme]
 
-class Client(Socks5):
-    def __init__(self, host: str = "0.0.0.0", port: int = 1080) -> None:
-        super().__init__(host=host, port=port, connect_session_class=ConnectSession)
+        logger.info(f"{capwords(method)} request to ('{host}', {port})")
+        try:
+            remote = await connect_remote(host, int(port))
+        except Exception:
+            return
+
+        for index, data in enumerate(
+            (" ".join([method, urlpath, version]) + "\r\n").encode("ascii")
+        ):
+            sock.r._buffer.insert(index, data)
+        await bridge(remote, sock)
+        await remote.close()
+
+    async def connect(self, sock: TCPSocket) -> None:
+        async def reply(http_version: str, status_code: HTTPStatus) -> None:
+            await sock.send(
+                (
+                    f"{http_version} {status_code.value} {status_code.phrase}\r\n"
+                    "Server: O-O\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                ).encode("ascii")
+            )
+
+        # parse HTTP CONNECT
+        raw_request = b""
+        while True:
+            raw_request += await sock.recv(8192)
+            if raw_request.endswith(b"\r\n\r\n"):
+                break
+        method, hostport, version = (
+            raw_request.splitlines()[0].decode("ascii").split(" ")
+        )
+        host, port = hostport.split(":")
+        logger.info(f"Connect request to ('{host}', {port})")
+
+        try:
+            remote = await connect_remote(host, int(port))
+        except asyncio.TimeoutError:
+            await reply(version, HTTPStatus.GATEWAY_TIMEOUT)
+        except OSError:
+            await reply(version, HTTPStatus.BAD_GATEWAY)
+        else:
+            await reply(version, HTTPStatus.OK)
+            await bridge(remote, sock)
+            await remote.close()
+
+    async def run_server(self) -> typing.NoReturn:
+        server = await asyncio.start_server(self.dispatch, self.host, self.port)
+        logger.info(f"Proxy Policy: {config.proxy_policy}")
+        logger.info(f"HTTP Server serveing on {server.sockets[0].getsockname()}")
+
+        def termina(signo, frame):
+            server.close()
+            logger.info(f"HTTP Server has closed.")
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGINT, termina)
+        signal.signal(signal.SIGTERM, termina)
+
+        while True:
+            await asyncio.sleep(1)
+
+    def run(self) -> None:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.run_server())
+        loop.stop()
